@@ -1,0 +1,13 @@
+services:
+    chinit:
+        container_name: chinit_demo
+        image: chinit
+        build: .
+        ports:
+        - 1180:80
+    healthcheck:
+      test: ["CMD", "http://localhost/",]  
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s        
