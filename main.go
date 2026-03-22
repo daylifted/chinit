@@ -1,16 +1,12 @@
 package main
 
 import (
-	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"os/exec"
 	"strings"
 	"syscall"
-	"time"
 )
 
 var (
@@ -21,29 +17,38 @@ var (
 	errBadDuration  = errors.New("invalid duration")
 )
 
-const usage = `Usage:
-  sh -c <command>                       exec a command directly
-  sh <url> [flags]                      HTTP health-check
+const usage = `chinit — Swiss Army knife for scratch containers
 
-Flags (HTTP mode):
+Usage:
+  sh -c <command>                                          exec mode
+  sh <url> [--grep p] [--debug] [-k] [-ttl d]              health check
+  sh pack -input <binary> -output <file> [-key <secret>]   pack a binary
+  sh (no args, with embedded payload)                       run embedded payload
+  sh --help                                                 show help
+
+Flags (health check mode):
   --grep <pattern>   exit 1 if pattern not found in response body
   --debug            print response body to stdout
   -k                 skip TLS certificate verification
   -ttl <duration>    request timeout (default 3s)
 
-  --help             show this help
+Flags (pack mode):
+  -input <binary>    input binary to encrypt and pack
+  -output <file>     output packed binary
+  -key <secret>      encryption key (default: PACKED_KEY env or system-derived)
+
+At runtime, set PACKED_KEY env var to provide the decryption key.
 
 Examples:
   sh -c /usr/bin/myapp
   sh http://service:9100/metrics
   sh https://service/health --grep "ready for work"
-  sh https://service/health --debug -k -ttl 10s
+  sh pack -input ./myapp -output ./packed-sh -key "$SECRET"
 `
 
 func printHelp() {
 	fmt.Print(usage)
 }
-
 
 func fail() {
 	fmt.Println("error")
@@ -51,17 +56,14 @@ func fail() {
 }
 
 func main() {
-	if len(os.Args) < 2 {
-		fail()
-	}
-
-	if os.Args[1] == "--help" {
+	// --help anywhere
+	if len(os.Args) > 1 && os.Args[1] == "--help" {
 		printHelp()
 		return
 	}
 
-	switch {
-	case os.Args[1] == "-c":
+	// -c: exec mode
+	if len(os.Args) > 1 && os.Args[1] == "-c" {
 		argv, err := buildArgv(os.Args[2:])
 		if err != nil {
 			fail()
@@ -73,7 +75,11 @@ func main() {
 		if err := syscall.Exec(path, argv, os.Environ()); err != nil {
 			fail()
 		}
-	case strings.HasPrefix(os.Args[1], "http://") || strings.HasPrefix(os.Args[1], "https://"):
+		return
+	}
+
+	// URL prefix: health check mode
+	if len(os.Args) > 1 && (strings.HasPrefix(os.Args[1], "http://") || strings.HasPrefix(os.Args[1], "https://")) {
 		cfg, err := parseFlags(os.Args[2:])
 		if err != nil {
 			fail()
@@ -82,97 +88,36 @@ func main() {
 		if err := httpCheck(client, os.Args[1], cfg.grepPattern, cfg.debug); err != nil {
 			fail()
 		}
-	default:
-		fail()
+		return
 	}
-}
 
-// buildArgv splits the command string and appends any extra args.
-func buildArgv(args []string) ([]string, error) {
-	if len(args) == 0 {
-		return nil, errBadArgs
-	}
-	parts := strings.Fields(args[0])
-	if len(parts) == 0 {
-		return nil, errBadArgs
-	}
-	return append(parts, args[1:]...), nil
-}
-
-type httpConfig struct {
-	grepPattern string
-	skipTLS     bool
-	debug       bool
-	timeout     time.Duration
-}
-
-// parseFlags parses the optional flags that follow a URL argument.
-func parseFlags(args []string) (httpConfig, error) {
-	cfg := httpConfig{timeout: 3 * time.Second}
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--debug":
-			cfg.debug = true
-		case "--grep":
-			if i+1 >= len(args) {
-				return cfg, errMissingValue
-			}
-			i++
-			cfg.grepPattern = args[i]
-		case "-k":
-			cfg.skipTLS = true
-		case "-ttl":
-			if i+1 >= len(args) {
-				return cfg, errMissingValue
-			}
-			i++
-			d, err := time.ParseDuration(args[i])
-			if err != nil {
-				return cfg, errBadDuration
-			}
-			cfg.timeout = d
-		default:
-			return cfg, errBadArgs
+	// pack subcommand
+	if len(os.Args) > 1 && os.Args[1] == "pack" {
+		if err := packCmd(os.Args[2:]); err != nil {
+			fmt.Fprintf(os.Stderr, "pack: %v\n", err)
+			os.Exit(1)
 		}
+		return
 	}
-	return cfg, nil
-}
 
-// buildClient constructs an http.Client with the given TLS and timeout settings.
-func buildClient(skipTLS bool, timeout time.Duration) *http.Client {
-	return &http.Client{
-		Timeout: timeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: skipTLS}, //nolint:gosec
-		},
-	}
-}
-
-// httpCheck performs a GET request and validates the response status and optional grep pattern.
-// When debug is true the full response body is printed to stdout.
-func httpCheck(client *http.Client, url, grepPattern string, debug bool) error {
-	resp, err := client.Get(url)
+	// no recognized flag: check for embedded payload
+	encryptedPayload, err := detectPayload()
 	if err != nil {
-		return err
+		fmt.Fprintf(os.Stderr, "payload detection: %v\n", err)
+		os.Exit(1)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return errNon2xx
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
+	if encryptedPayload != nil {
+		if err := runPayload(encryptedPayload); err != nil {
+			fmt.Fprintf(os.Stderr, "payload: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
-	if debug {
-		fmt.Print(string(body))
+	// nothing matched
+	if len(os.Args) < 2 {
+		printHelp()
+		os.Exit(1)
 	}
-
-	if grepPattern != "" && !strings.Contains(string(body), grepPattern) {
-		return errGrepMiss
-	}
-	fmt.Println("chinit: OK")
-	return nil
+	fail()
 }
